@@ -56,6 +56,9 @@
   @media (max-width:520px) { .steps { grid-template-columns:1fr; } }
   .panel { background:var(--panel); border:1.5px solid var(--line); border-radius:var(--r-md); padding:24px; display:grid; gap:12px; }
   .panel label { font-weight:650; }
+  .panel label .opt { font-weight:400; color:var(--mut); }
+  .panel #email-why { margin:-4px 0 8px; }
+  input:user-invalid { border-color:var(--signal); }
   .fine { color:var(--mut); font-size:.88rem; line-height:1.45; margin:4px 0 0; }
 
   /* Game: photo fills the screen, map docks bottom-right */
@@ -132,6 +135,10 @@
     <form class="panel" onsubmit="return false">
       <label for="name">Your name or nickname</label>
       <input id="name" maxlength="40" autocomplete="off">
+      <label for="email">Email <span class="opt">(optional)</span></label>
+      <input id="email" type="email" maxlength="100" autocomplete="email" aria-describedby="email-why">
+      <p class="fine" id="email-why">We'll write to you once, at the end of the project, to tell you whether the model ended up beating you.
+         Only our project team sees it, and we delete it after that email.</p>
       <button id="start" disabled>Start playing</button>
       <p class="fine">Only your <b>first</b> run is recorded: your nickname and your 30 pins are averaged with everyone else's
          into the <b>human baseline</b> that we compare the model against. Replays are fine but don't count,
@@ -186,7 +193,8 @@ const uid = store.get("uid") || (crypto.randomUUID ? crypto.randomUUID() : Strin
 store.set("uid", uid);
 
 $("name").value = store.get("name") || "";
-$("name").oninput = () => $("start").disabled = !$("name").value.trim();
+$("email").value = store.get("email") || "";
+$("name").oninput = $("email").oninput = () => $("start").disabled = !$("name").value.trim() || !$("email").checkValidity();
 $("name").oninput();
 
 const ready = fetch("corpus.json").then(r => r.json()).then(c => version = c.version);  // ground truth is never on this site
@@ -226,7 +234,7 @@ function ticks(el, current) {
 
 $("start").onclick = async () => {
   await ready;
-  store.set("name", $("name").value.trim());
+  store.set("name", $("name").value.trim()); store.set("email", $("email").value.trim());
   show("game");
   map = L.map("map", { worldCopyJump: true, minZoom: 1, zoomControl: true }).setView([25, 10], 1);
   L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom: 18, attribution: "&copy; OpenStreetMap" }).addTo(map);
@@ -327,7 +335,7 @@ async function finish() {
   if (!ENDPOINT) { $("status").textContent = "(dev mode: no endpoint configured, nothing saved)"; return; }
   try {
     const r = await fetch(ENDPOINT + "/", { method: "POST", headers: { "Content-Type": "application/json" },
-                                            body: JSON.stringify({ version, uid, name: $("name").value.trim(), guesses }) });
+                                            body: JSON.stringify({ version, uid, name: $("name").value.trim(), email: $("email").value.trim(), guesses }) });
     if (r.status === 410) { $("status").textContent = "The photo set was updated while you played. Please reload and start again."; return; }
     if (!r.ok) { $("status").textContent = `Could not save (${r.status}). Please tell us, and don't reload.`; return; }
     const j = await r.json();
