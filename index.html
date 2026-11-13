@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Can you beat an 8B model at GeoGuessr?</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css">
+<style>
+  :root { --bg:#14171c; --fg:#eef1f5; --mut:#9aa4b2; --acc:#3ddc97; --card:#1f242c; }
+  * { box-sizing:border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--fg); font:16px/1.5 system-ui, sans-serif; }
+  .screen { display:none; height:100%; }
+  .screen.on { display:block; }
+  #intro, #end { display:none; place-items:center; padding:16px; }
+  #intro.on, #end.on { display:grid; }
+  .card { background:var(--card); border-radius:12px; padding:24px; max-width:480px; width:100%; }
+  h1 { margin:0 0 8px; font-size:1.4rem; }
+  input, button { font:inherit; border-radius:8px; border:1px solid #39414d; padding:10px 14px; }
+  input { background:#0f1217; color:var(--fg); width:100%; margin:12px 0; }
+  button { background:var(--acc); color:#06210f; border:0; font-weight:600; cursor:pointer; }
+  button:disabled { background:#39414d; color:var(--mut); cursor:not-allowed; }
+  .mut { color:var(--mut); font-size:.9rem; }
+  /* game: photo fills the screen, map floats bottom-right like GeoGuessr */
+  #game { position:relative; overflow:hidden; }
+  #photo { width:100%; height:100%; object-fit:contain; background:#000; user-select:none; -webkit-user-drag:none; pointer-events:none; }
+  #hud { position:absolute; top:12px; left:12px; background:#000a; padding:6px 12px; border-radius:8px; z-index:500; }
+  #mapbox { position:absolute; right:12px; bottom:12px; width:340px; height:240px; z-index:600; display:flex; flex-direction:column;
+            gap:8px; transition:width .15s, height .15s; }
+  #mapbox.big { width:min(900px, calc(100% - 24px)); height:min(640px, calc(100% - 24px)); }
+  #map { flex:1; border-radius:10px; border:2px solid #fff4; }
+  #result { background:#000c; padding:8px 12px; border-radius:8px; display:none; }
+  #expand { display:none; }
+  @media (max-width:700px), (pointer:coarse) { #mapbox { width:calc(100% - 24px); height:40%; } #expand { display:block; } }
+</style>
+</head>
+<body>
+
+<div id="intro" class="screen on">
+  <div class="card">
+    <h1>Can you beat an 8B model at GeoGuessr?</h1>
+    <p>30 street-level photos from around the world. For each one, click the map where you think it was taken.
+       You can zoom and pan the map, but not the photo.</p>
+    <p class="mut">This is the human reference for a course project on photo geolocation. Only your <b>first</b> run counts
+       (replaying is fine, it just isn't recorded), so please don't look anything up.</p>
+    <input id="name" placeholder="Your name or nickname" maxlength="40" autocomplete="off">
+    <button id="start" disabled>Start</button>
+  </div>
+</div>
+
+<div id="game" class="screen">
+  <img id="photo" alt="" draggable="false">
+  <div id="hud"></div>
+  <div id="mapbox">
+    <div id="result"></div>
+    <div id="map"></div>
+    <button id="expand">Enlarge map</button>
+    <button id="guess" disabled>Place your pin</button>
+  </div>
+</div>
+
+<div id="end" class="screen">
+  <div class="card">
+    <h1>Done!</h1>
+    <p id="summary"></p>
+    <p id="status" class="mut"></p>
+  </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
+<script>
+const ENDPOINT = "https://geo-human-baseline.oscarjauffret.workers.dev";  // Cloudflare Worker URL (see ../worker/); empty = nothing is sent
+const N = 30;
+const $ = id => document.getElementById(id);
+const show = id => document.querySelectorAll(".screen").forEach(s => s.classList.toggle("on", s.id === id));
+const store = { get: k => { try { return localStorage.getItem(k); } catch { return null; } },
+                set: (k, v) => { try { localStorage.setItem(k, v); } catch {} } };
+
+const geoscore = d => 5000 * Math.exp(-d / 1492.7);  // same metric as the model eval
+function km(a, b) {
+  const r = Math.PI / 180, h = Math.sin((b[0]-a[0])*r/2)**2 + Math.cos(a[0]*r)*Math.cos(b[0]*r)*Math.sin((b[1]-a[1])*r/2)**2;
+  return 2 * 6371.0088 * Math.asin(Math.sqrt(h));
+}
+
+let version, i = 0, pin = null, marker = null, layers = [], guesses = [], total = 0, map;
+const uid = store.get("uid") || (crypto.randomUUID ? crypto.randomUUID() : String(Math.random()).slice(2));
+store.set("uid", uid);
+
+$("name").value = store.get("name") || "";
+$("name").oninput = () => $("start").disabled = !$("name").value.trim();
+$("name").oninput();
+
+const ready = fetch("corpus.json").then(r => r.json()).then(c => version = c.version);  // ground truth is never on this site
+
+$("start").onclick = async () => {
+  await ready;
+  store.set("name", $("name").value.trim());
+  show("game");
+  map = L.map("map", { worldCopyJump: true, minZoom: 1, zoomControl: true }).setView([25, 10], 1);
+  L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom: 18, attribution: "&copy; OpenStreetMap" }).addTo(map);
+  map.on("click", e => { if (!$("result").style.display || $("result").style.display === "none") place(e.latlng); });
+  const box = $("mapbox");  // desktop: map grows on hover while placing a pin
+  box.onmouseenter = () => { if (matchMedia("(pointer:fine)").matches && !guessed) grow(true); };
+  box.onmouseleave = () => { if (!guessed) grow(false); };
+  $("expand").onclick = () => grow(!box.classList.contains("big"));
+  round();
+};
+
+let guessed = false;
+function grow(big) { $("mapbox").classList.toggle("big", big); setTimeout(() => map.invalidateSize(), 200); }
+
+function round() {
+  guessed = false; pin = null;
+  layers.forEach(l => l.remove()); layers = []; marker = null;
+  $("result").style.display = "none";
+  $("photo").src = `images/${String(i + 1).padStart(2, "0")}.jpg`;
+  $("hud").textContent = `Photo ${i + 1} / ${N}`;
+  $("guess").disabled = true; $("guess").textContent = "Place your pin";
+  grow(false); map.setView([25, 10], 1);
+}
+
+function place(ll) {
+  pin = [ll.lat, ((ll.lng + 180) % 360 + 360) % 360 - 180];  // wrap panned-around-the-world clicks back to [-180, 180]
+  if (marker) marker.setLatLng(ll); else marker = L.marker(ll).addTo(map);
+  $("guess").disabled = false; $("guess").textContent = "Guess";
+}
+
+async function reveal() {  // truth of this round comes from the Worker, only after the guess
+  if (!ENDPOINT) return null;
+  try {
+    const r = await fetch(ENDPOINT + "/reveal", { method: "POST", headers: { "Content-Type": "application/json" },
+                                                  body: JSON.stringify({ version, n: i + 1, guess: pin }) });
+    return r.ok ? await r.json() : null;
+  } catch { return null; }
+}
+
+$("guess").onclick = async () => {
+  if (!guessed) {
+    guessed = true; $("guess").disabled = true;
+    guesses.push(pin);
+    const res = await reveal(); $("guess").disabled = false;
+    if (!res) { $("result").style.display = "block"; $("result").textContent = "Guess recorded."; $("guess").textContent = i + 1 < N ? "Next photo" : "Finish"; return; }
+    const t = res.truth, d = res.km, s = res.score; total += s;
+    layers.push(L.marker(t, { icon: L.divIcon({ html: "🎯", className: "", iconSize: [24, 24], iconAnchor: [12, 12] }) }).addTo(map),
+                L.polyline([pin, t], { color: "#3ddc97", dashArray: "6" }).addTo(map));
+    $("result").style.display = "block";
+    $("result").textContent = `${Math.round(d).toLocaleString()} km away · ${Math.round(s)} points`;
+    grow(true);
+    setTimeout(() => map.fitBounds([pin, t], { padding: [50, 50], maxZoom: 8 }), 250);
+    $("guess").textContent = i + 1 < N ? "Next photo" : "Finish";
+  } else if (++i < N) round();
+  else finish();
+};
+
+async function finish() {
+  show("end");
+  $("summary").textContent = total ? `Your average score: ${Math.round(total / N)} / 5000.` : "Thanks for playing!";
+  const doneKey = "done_" + version, first = !store.get(doneKey);
+  $("status").textContent = first ? "Saving your answers…" : "You already played before, so this run is not recorded.";
+  if (!first) return;
+  if (!ENDPOINT) { $("status").textContent = "(dev mode: no endpoint configured, nothing saved)"; return; }
+  try {
+    const r = await fetch(ENDPOINT + "/", { method: "POST", headers: { "Content-Type": "application/json" },
+                                      body: JSON.stringify({ version, uid, name: $("name").value.trim(), guesses }) });
+    if (r.ok) { store.set(doneKey, "1"); $("status").textContent = "Saved, thanks! You can reload to replay (not recorded)."; }
+    else if (r.status === 410) $("status").textContent = "The photo set was updated while you played. Please reload and start again.";
+    else if (r.status === 409) { store.set(doneKey, "1"); $("status").textContent = "You already played before, so this run is not recorded."; }
+    else $("status").textContent = `Could not save (${r.status}). Please tell us, and don't reload.`;
+  } catch (e) { $("status").textContent = "Could not reach the server. Please tell us, and don't reload."; }
+}
+</script>
+</body>
+</html>
